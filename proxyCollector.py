@@ -1,10 +1,10 @@
 import requests
 import time
 import pandas as pd
-import random
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
+import os
 
 # Configure logging
 logging.basicConfig(
@@ -20,6 +20,64 @@ TEST_URLS = [
     "https://ipinfo.io/json"  # Returns detailed IP information
 ]
 
+def clear_old_files(country_code):
+    """
+    Clears the old working proxies file and blacklist file at the start of the program.
+    :param country_code: The country code for naming the working proxies file.
+    """
+    working_proxies_file = f"working_proxies_{country_code}.xlsx"
+    blacklist_file = "blacklist.txt"
+    
+    # Clear the working proxies file if it exists
+    if os.path.exists(working_proxies_file):
+        os.remove(working_proxies_file)
+        logging.info(f"Cleared old proxies from {working_proxies_file}.")
+    
+    # Clear the blacklist file if it exists
+    if os.path.exists(blacklist_file):
+        with open(blacklist_file, "w") as f:
+            f.write("")  # Empty the file
+        logging.info(f"Cleared old entries from {blacklist_file}.")
+
+def is_blacklisted(proxy, filename="blacklist.txt"):
+    """
+    Checks if a proxy is blacklisted.
+    :param proxy: The proxy in "IP:Port" format.
+    :param filename: Name of the blacklist file.
+    :return: True if blacklisted, False otherwise.
+    """
+    try:
+        with open(filename, "r") as f:
+            blacklist = f.read().splitlines()
+        return proxy in blacklist
+    except FileNotFoundError:
+        return False
+
+def add_to_blacklist(proxy, filename="blacklist.txt"):
+    """
+    Adds a proxy to the blacklist file.
+    :param proxy: The proxy in "IP:Port" format.
+    :param filename: Name of the blacklist file.
+    """
+    with open(filename, "a") as f:
+        f.write(f"{proxy}\n")
+    logging.info(f"Added {proxy} to blacklist.")
+
+def save_working_proxy_to_file(proxy_info, filename="working_proxies.xlsx"):
+    """
+    Saves a single working proxy to the Excel file.
+    If the file doesn't exist, it creates a new one. Otherwise, it appends to the existing file.
+    :param proxy_info: Dictionary containing proxy details (Proxy, Protocol, Country, Latency).
+    :param filename: Name of the output file.
+    """
+    df = pd.DataFrame([proxy_info])
+    if not os.path.exists(filename):
+        df.to_excel(filename, index=False)
+    else:
+        existing_df = pd.read_excel(filename)
+        updated_df = pd.concat([existing_df, df], ignore_index=True)
+        updated_df.to_excel(filename, index=False)
+
 def fetch_proxies_from_proxyscrape(protocol, country_code):
     """
     Fetches proxies from ProxyScrape API.
@@ -29,7 +87,6 @@ def fetch_proxies_from_proxyscrape(protocol, country_code):
     """
     url = f"https://api.proxyscrape.com/v2/?request=getproxies&protocol={protocol}&timeout=10000&country={country_code}"
     response = requests.get(url)
-    
     if response.status_code == 200:
         proxies = response.text.split("\r\n")  # Split the proxies by newline
         return [proxy for proxy in proxies if proxy.strip()]  # Remove empty strings
@@ -45,7 +102,6 @@ def fetch_proxies_from_pubproxy(protocol):
     """
     url = f"http://pubproxy.com/api/proxy?format=txt&type={protocol}"
     response = requests.get(url)
-    
     if response.status_code == 200:
         proxies = response.text.split("\n")
         return [proxy.strip() for proxy in proxies if proxy.strip()]
@@ -155,7 +211,6 @@ def get_proxy_country(proxy):
     """
     ip = proxy.split(":")[0]  # Extract the IP address from the proxy
     url = f"http://ip-api.com/json/{ip}"  # IP geolocation API endpoint
-    
     try:
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
@@ -168,130 +223,60 @@ def get_proxy_country(proxy):
             logging.error(f"Failed to fetch country for {proxy}: HTTP {response.status_code}")
     except Exception as e:
         logging.error(f"Error fetching country for {proxy}: {e}")
-    
     return "Unknown"
 
-def save_working_proxies_to_cache(proxies, filename="proxies_cache.json"):
+def test_proxies_concurrently(proxies, protocol, country_code):
     """
-    Saves working proxies to a JSON file.
-    :param proxies: List of working proxies (with protocol and country).
-    :param filename: Name of the cache file.
-    """
-    with open(filename, "w") as f:
-        json.dump(proxies, f, indent=4)
-    logging.info(f"Saved {len(proxies)} proxies to cache.")
-
-def load_working_proxies_from_cache(filename="proxies_cache.json"):
-    """
-    Loads working proxies from a JSON file.
-    :param filename: Name of the cache file.
-    :return: List of cached proxies.
-    """
-    try:
-        with open(filename, "r") as f:
-            proxies = json.load(f)
-            logging.info(f"Loaded {len(proxies)} proxies from cache.")
-            return proxies
-    except FileNotFoundError:
-        logging.info("No proxy cache found.")
-        return []
-
-def add_to_blacklist(proxy, filename="blacklist.txt"):
-    """
-    Adds a proxy to the blacklist file.
-    :param proxy: The proxy in "IP:Port" format.
-    :param filename: Name of the blacklist file.
-    """
-    with open(filename, "a") as f:
-        f.write(f"{proxy}\n")
-    logging.info(f"Added {proxy} to blacklist.")
-
-def is_blacklisted(proxy, filename="blacklist.txt"):
-    """
-    Checks if a proxy is blacklisted.
-    :param proxy: The proxy in "IP:Port" format.
-    :param filename: Name of the blacklist file.
-    :return: True if blacklisted, False otherwise.
-    """
-    try:
-        with open(filename, "r") as f:
-            blacklist = f.read().splitlines()
-        return proxy in blacklist
-    except FileNotFoundError:
-        return False
-
-def test_proxies_concurrently(proxies, protocol):
-    """
-    Tests proxies concurrently using multithreading.
+    Tests proxies concurrently using multithreading and saves working proxies immediately.
+    Updates the blacklist immediately for non-working proxies.
     :param proxies: List of proxies to test.
     :param protocol: The proxy protocol (http, https, socks4, socks5).
+    :param country_code: The country code for naming the working proxies file.
     :return: List of working proxies.
     """
     working_proxies = []
-
+    filename = f"working_proxies_{country_code}.xlsx"
     with ThreadPoolExecutor(max_workers=10) as executor:
         results = executor.map(lambda proxy: (proxy, test_proxy(proxy, protocol)), proxies)
         for proxy, is_working in results:
             if is_working:
-                working_proxies.append(proxy)
-
+                latency = measure_latency(proxy, protocol)
+                if latency is not None:
+                    country = get_proxy_country(proxy)
+                    logging.info(f"Proxy {proxy} ({protocol}) works and is from {country}. Latency: {latency:.2f}s")
+                    proxy_info = {"Proxy": proxy, "Protocol": protocol, "Country": country, "Latency": latency}
+                    working_proxies.append(proxy_info)
+                    save_working_proxy_to_file(proxy_info, filename)
+                    time.sleep(1)  # Respect rate limits of the geolocation API
+            else:
+                add_to_blacklist(proxy)  # Update blacklist immediately
     return working_proxies
 
-def fetch_and_validate_proxies(country_code, target_country):
+def fetch_and_validate_proxies(country_code):
     """
     Fetches proxies for all protocols, validates them, and filters them by the specified country.
     :param country_code: The country code for filtering proxies.
-    :param target_country: The desired country name (e.g., "United States").
     :return: A list of dictionaries containing working proxies, their protocols, and countries.
     """
     all_proxies = fetch_proxies(country_code)
     working_proxies = []
-
     for protocol, proxies in all_proxies.items():
         logging.info(f"Fetched {len(proxies)} proxies for {protocol.upper()}...")
-        
         # Filter out blacklisted proxies
         proxies = [proxy for proxy in proxies if not is_blacklisted(proxy)]
-        
-        # Test proxies concurrently
-        valid_proxies = test_proxies_concurrently(proxies, protocol)
-        
-        for proxy in valid_proxies:
-            latency = measure_latency(proxy, protocol)
-            if latency is not None:
-                country = get_proxy_country(proxy)
-                logging.info(f"Proxy {proxy} ({protocol}) works and is from {country}. Latency: {latency:.2f}s")
-                if country == target_country:  # Filter proxies by country
-                    working_proxies.append({"Proxy": proxy, "Protocol": protocol, "Country": country, "Latency": latency})
-                time.sleep(1)  # Respect rate limits of the geolocation API
-            else:
-                add_to_blacklist(proxy)
-    
-    logging.info(f"Found {len(working_proxies)} working proxies from {target_country}.")
+        # Test proxies concurrently and save working ones immediately
+        valid_proxies = test_proxies_concurrently(proxies, protocol, country_code)
+        working_proxies.extend(valid_proxies)
+    logging.info(f"Found {len(working_proxies)} working proxies.")
     return working_proxies
 
 # Example usage
 if __name__ == "__main__":
     # User inputs
     country_code = input("Enter the country code (e.g., US for USA, GB for UK): ").strip().upper()
-    target_country = input("Enter the full country name (e.g., United States, United Kingdom): ").strip()
-
-    # Load cached proxies if available
-    cached_proxies = load_working_proxies_from_cache()
-
-    if cached_proxies:
-        logging.info("Using cached proxies.")
-        working_proxies = cached_proxies
-    else:
-        # Fetch and validate proxies for all protocols and the specified country
-        working_proxies = fetch_and_validate_proxies(country_code, target_country)
-        save_working_proxies_to_cache(working_proxies)
-
-    # Save results to an Excel file
-    if working_proxies:
-        df = pd.DataFrame(working_proxies)
-        filename = f"working_proxies_{country_code}.xlsx"
-        df.to_excel(filename, index=False)
-        logging.info(f"Saved {len(working_proxies)} working proxies to {filename}.")
-    else:
-        logging.info("No working proxies found.")
+    
+    # Clear old files at the start of the program
+    clear_old_files(country_code)
+    
+    # Fetch and validate proxies for all protocols
+    working_proxies = fetch_and_validate_proxies(country_code)
